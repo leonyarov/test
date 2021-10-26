@@ -1,2 +1,2 @@
 print("!dani gay")
-print("!Dani mamash gay")
+print("!Dori mamash gay")
