@@ -25,48 +25,42 @@ class BloodBankApp:
         self.login_gui()
 
     def create_database(self):
-        conn = sqlite3.connect('blood_bank.db')
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS donors (
-                     id INTEGER PRIMARY KEY,
-                     name TEXT NOT NULL,
-                     id_number TEXT NOT NULL,
-                     blood_type TEXT NOT NULL,
-                     donation_date TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS blood_supply (
-                     blood_type TEXT PRIMARY KEY,
-                     quantity INTEGER NOT NULL,
-                     donation_date TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS audit_trail (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     action TEXT NOT NULL,
-                     details TEXT,
-                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS users  (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     username TEXT NOT NULL,
-                     password TEXT NOT NULL,
-                     role TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS appointments (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        donor_name TEXT NOT NULL,
-                        blood_type TEXT NOT NULL,
-                        appointment_date TEXT NOT NULL,
-                        appointment_time TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS appointments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    donor_name TEXT NOT NULL,
-                    blood_type TEXT NOT NULL,
-                    appointment_date TEXT NOT NULL,
-                    appointment_time TEXT NOT NULL
-                )''')
+        with sqlite3.connect('blood_bank.db', timeout=30) as conn:  # Added timeout to prevent locking
+            c = conn.cursor()
+            # Set SQLite to use WAL mode
+            c.execute("PRAGMA journal_mode=WAL;")
+            c.execute("PRAGMA busy_timeout=30000;")  # Wait up to 30 seconds for a lock to clear
 
-        try:
-            c.execute("ALTER TABLE blood_supply ADD COLUMN donation_date TEXT")
-        except sqlite3.OperationalError:
-            pass  # The column already exists, so we pass
-        conn.commit()
-        conn.close()
+            c.execute('''CREATE TABLE IF NOT EXISTS donors (
+                         id INTEGER PRIMARY KEY,
+                         name TEXT NOT NULL,
+                         id_number TEXT NOT NULL,
+                         blood_type TEXT NOT NULL,
+                         donation_date TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS blood_supply (
+                         blood_type TEXT PRIMARY KEY,
+                         quantity INTEGER NOT NULL,
+                         donation_date TEXT)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS audit_trail (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         action TEXT NOT NULL,
+                         details TEXT,
+                         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS users  (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         username TEXT NOT NULL,
+                         password TEXT NOT NULL,
+                         role TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS appointments (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            donor_name TEXT NOT NULL,
+                            blood_type TEXT NOT NULL,
+                            appointment_date TEXT NOT NULL,
+                            appointment_time TEXT NOT NULL)''')
+            try:
+                c.execute("ALTER TABLE blood_supply ADD COLUMN donation_date TEXT")
+            except sqlite3.OperationalError:
+                pass  # The column already exists, so we pass
 
     def add_default_users(self):
         conn = sqlite3.connect('blood_bank.db')
@@ -185,20 +179,39 @@ class BloodBankApp:
             messagebox.showerror("Error", "You don't have permission to view metadata!")
             return
 
+        # Create the metadata window
         metadata_window = tk.Toplevel(self.root)
         metadata_window.title("View Metadata (Audit Log)")
 
-        frame = ttk.Frame(metadata_window, padding="10 10 10 10")
-        frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Create a canvas with a scrollbar
+        canvas = tk.Canvas(metadata_window)
+        scrollbar = ttk.Scrollbar(metadata_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
 
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")
+            )
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Pack the canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Query the audit trail logs from the database
         conn = sqlite3.connect('blood_bank.db')
         c = conn.cursor()
         c.execute("SELECT * FROM audit_trail")
         logs = c.fetchall()
         conn.close()
 
+        # Display each log in the scrollable frame
         for idx, log in enumerate(logs):
-            ttk.Label(frame, text=log).grid(row=idx, column=0, pady=5)
+            ttk.Label(scrollable_frame, text=log).grid(row=idx, column=0, pady=5, padx=10)
 
     # View de-identified data (Research Student)
     def view_deidentified_data_gui(self):
@@ -292,32 +305,37 @@ class BloodBankApp:
         # Add donor function
 
     def add_donor(self, name, id_number, blood_type, donation_date):
+        """
+        Add a donor only if their blood is not expired.
+        """
         # Ensure the donation_date is passed, otherwise set it to today
         if not donation_date:
             donation_date = datetime.now().strftime('%Y-%m-%d')
 
-        conn = sqlite3.connect('blood_bank.db')
-        c = conn.cursor()
+        # Check if the blood is expired before adding
+        if not self.check_blood_expiration(blood_type, donation_date):
+            messagebox.showerror("Error", f"Cannot add donor. Blood of type {blood_type} is expired.")
+            return  # Exit without adding the donor if blood is expired
 
-        # Insert the donor information
-        c.execute("INSERT INTO donors (name, id_number, blood_type, donation_date) VALUES (?, ?, ?, ?)",
-                  (name, id_number, blood_type, donation_date))
+        with sqlite3.connect('blood_bank.db', timeout=10) as conn:  # Added timeout and 'with' statement
+            c = conn.cursor()
 
-        # Update the blood supply and set the donation date for the blood
-        c.execute("UPDATE blood_supply SET quantity = quantity + 1, donation_date = ? WHERE blood_type = ?",
-                  (donation_date, blood_type))
+            # Insert the donor information
+            c.execute("INSERT INTO donors (name, id_number, blood_type, donation_date) VALUES (?, ?, ?, ?)",
+                      (name, id_number, blood_type, donation_date))
 
-        # Insert into blood_supply if the blood type doesn't already exist
-        c.execute("INSERT OR IGNORE INTO blood_supply (blood_type, quantity, donation_date) VALUES (?, 1, ?)",
-                  (blood_type, donation_date))
+            # Update the blood supply and set the donation date for the blood
+            c.execute("UPDATE blood_supply SET quantity = quantity + 1, donation_date = ? WHERE blood_type = ?",
+                      (donation_date, blood_type))
 
-        conn.commit()
-        conn.close()
+            # Insert into blood_supply if the blood type doesn't already exist
+            c.execute("INSERT OR IGNORE INTO blood_supply (blood_type, quantity, donation_date) VALUES (?, 1, ?)",
+                      (blood_type, donation_date))
 
-        self.check_blood_expiration()  # checks if the blood is expired
+            conn.commit()  # Ensure that the transaction is committed
+
         self.log_action("Add Donor", f"Name: {name}, ID: {id_number}, Blood Type: {blood_type}, Date: {donation_date}")
         messagebox.showinfo("Success", "Donor added successfully")
-
     # GUI for issuing blood (used by Admin and User)
 
     def issue_blood_gui(self):
@@ -420,10 +438,12 @@ class BloodBankApp:
         conn.close()
 
     def log_action(self, action, details=""):
-        with sqlite3.connect('blood_bank.db', timeout=10) as conn:  # Added timeout
+        with sqlite3.connect('blood_bank.db', timeout=30) as conn:  # Added timeout
             c = conn.cursor()
+            c.execute("PRAGMA journal_mode=WAL;")  # Use WAL mode
+            c.execute("PRAGMA busy_timeout=30000;")  # Set busy timeout to 30 seconds
             c.execute("INSERT INTO audit_trail (action, details) VALUES (?, ?)", (action, details))
-            conn.commit()
+            conn.commit()  # Ensure changes are committed
 
     def schedule_appointment_gui(self):
         appointment_window = tk.Toplevel(self.root)
@@ -526,39 +546,29 @@ class BloodBankApp:
         self.log_action("Delete Appointment", f"Appointment ID: {appointment_id}")
         messagebox.showinfo("Success", "Appointment deleted successfully!")
 
-    def check_blood_expiration(self):
-        conn = sqlite3.connect('blood_bank.db')
-        c = conn.cursor()
-
-        # Get the current date
-        today = datetime.now().date()
+    def check_blood_expiration(self, blood_type, donation_date):
+        """
+        Check if the blood type is expired (over 35 days old) based on the given donation date.
+        Returns True if the blood is valid (not expired), otherwise returns False and logs/removes the expired blood.
+        """
         expiration_limit = timedelta(days=35)  # 35-day expiration limit
+        today = datetime.now().date()
 
-        # Select blood supply data
-        c.execute("SELECT blood_type, donation_date FROM blood_supply")
-        blood_units = c.fetchall()
+        try:
+            donation_date_dt = datetime.strptime(donation_date, "%Y-%m-%d").date()
+        except ValueError:
+            self.log_action("Invalid Date Format", f"Invalid donation date for {blood_type}: {donation_date}")
+            messagebox.showerror("Error", "Invalid donation date format!")
+            return False
 
-        for blood_type, donation_date in blood_units:
-            if donation_date is None:
-                # Skip the record if there's no donation_date
-                continue
+        # Check if the donation date is more than 35 days old
+        if today - donation_date_dt > expiration_limit:
+            # Log and indicate that the blood is expired
+            self.log_action("Remove Expired Blood", f"Blood Type: {blood_type}, Donation Date: {donation_date}")
+            messagebox.showinfo("Expired Blood", f"Blood type {blood_type} donated on {donation_date} has expired.")
+            return False  # Blood is expired
 
-            try:
-                donation_date_dt = datetime.strptime(donation_date, "%Y-%m-%d").date()
-                if today - donation_date_dt > expiration_limit:
-                    # Remove expired blood from supply
-                    c.execute("DELETE FROM blood_supply WHERE blood_type=? AND donation_date=?",
-                              (blood_type, donation_date))
-                    self.log_action("Remove Expired Blood", f"Blood Type: {blood_type}, Donation Date: {donation_date}")
-                    messagebox.showinfo("Expired Blood",
-                                        f"{blood_type} donated on {donation_date} has expired and was removed.")
-            except ValueError:
-                # Handle invalid date formats
-                self.log_action("Invalid Date Format", f"Invalid donation date for {blood_type}: {donation_date}")
-
-        conn.commit()
-        conn.close()
-
+        return True  # Blood is valid
 
 
 if __name__ == "__main__":
@@ -567,330 +577,3 @@ if __name__ == "__main__":
     app = BloodBankApp(root)
     root.mainloop()
 
-
-# import hashlib
-# import tkinter as tk
-# from tkinter import messagebox
-# from tkinter import PhotoImage
-# from tkinter import ttk
-# import sqlite3
-# import csv
-#
-# # Database setup
-# def create_database():
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute('''CREATE TABLE IF NOT EXISTS donors (
-#                  id INTEGER PRIMARY KEY,
-#                  name TEXT NOT NULL,
-#                  id_number TEXT NOT NULL,
-#                  blood_type TEXT NOT NULL,
-#                  donation_date TEXT NOT NULL)''')
-#     c.execute('''CREATE TABLE IF NOT EXISTS blood_supply (
-#                  blood_type TEXT PRIMARY KEY,
-#                  quantity INTEGER NOT NULL)''')
-#     c.execute('''CREATE TABLE IF NOT EXISTS audit_trail (
-#                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-#                  action TEXT NOT NULL,
-#                  details TEXT,
-#                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-#     c.execute('''CREATE TABLE IF NOT EXISTS users  (
-#                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-#                  username TEXT NOT NULL,
-#                  password TEXT NOT NULL,
-#                  role TEXT NOT NULL)''')
-#
-#     conn.commit()
-#     conn.close()
-#
-# create_database()
-#
-#
-# # Hashing passwords for security
-# def hash_password(password):
-#     return hashlib.sha256(password.encode()).hexdigest()
-#
-# # Adding audit log
-# def log_action(action, details=""):
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("INSERT INTO audit_trail (action, details) VALUES (?, ?)", (action, details))
-#     conn.commit()
-#     conn.close()
-#
-# # Create user function
-# def create_user(username, password, role):
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     hashed_password = hash_password(password)
-#     try:
-#         c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, hashed_password, role))
-#         conn.commit()
-#         log_action("Create User", f"User created: {username}, Role: {role}", username)
-#         messagebox.showinfo("Success", "User created successfully")
-#     except sqlite3.IntegrityError:
-#         messagebox.showerror("Error", "Username already exists")
-#     conn.close()
-#
-# # Function to authenticate users
-# def authenticate_user(username, password):
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("SELECT password, role FROM users WHERE username = ?", (username,))
-#     result = c.fetchone()
-#     conn.close()
-#     if result and hash_password(password) == result[0]:
-#         return result[1]
-#     else:
-#         return None
-#
-# # Adding donor function
-# def add_donor(name, id_number, blood_type, donation_date):
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("INSERT INTO donors (name, id_number, blood_type, donation_date) VALUES (?, ?, ?, ?)",
-#               (name, id_number, blood_type, donation_date))
-#     c.execute("UPDATE blood_supply SET quantity = quantity + 1 WHERE blood_type = ?", (blood_type,))
-#     c.execute("INSERT OR IGNORE INTO blood_supply (blood_type, quantity) VALUES (?, 1)", (blood_type,))
-#     conn.commit()
-#     conn.close()
-#     log_action("Add Donor", f"Name: {name}, ID: {id_number}, Blood Type: {blood_type}, Date: {donation_date}")
-#     messagebox.showinfo("Success", "Donor added successfully")
-#
-#
-# # Function for login
-# def login():
-#     username = entry_username.get()
-#     password = entry_password.get()
-#     role = authenticate_user(username, password)
-#
-#     if role:
-#         messagebox.showinfo("Success", f"Logged in as {role}")
-#         root.destroy()
-#         main_window(username, role)
-#     else:
-#         messagebox.showerror("Error", "Invalid username or password")
-#
-# # Issuing blood function
-# def issue_blood(blood_type, quantity):
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("SELECT quantity FROM blood_supply WHERE blood_type=?", (blood_type,))
-#     result = c.fetchone()
-#     if result and result[0] >= int(quantity):
-#         c.execute("UPDATE blood_supply SET quantity = quantity - ? WHERE blood_type=?", (quantity, blood_type))
-#         conn.commit()
-#         log_action("Issue Blood", f"Blood Type: {blood_type}, Quantity: {quantity}")
-#         messagebox.showinfo("Success", "Blood issued successfully")
-#     else:
-#         suggest_alternative_blood(blood_type)
-#     conn.close()
-#
-# # Suggest alternative blood types based on compatibility
-# def suggest_alternative_blood(requested_blood_type):
-#     compatibility = {
-#         'A+': ['A-', 'O+', 'O-'],
-#         'A-': ['O-'],
-#         'B+': ['B-', 'O+', 'O-'],
-#         'B-': ['O-'],
-#         'AB+': ['AB-', 'A+', 'A-', 'B+', 'B-', 'O+', 'O-'],
-#         'AB-': ['A-', 'B-', 'O-'],
-#         'O+': ['O-'],
-#         'O-': []
-#     }
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     for alt_type in compatibility.get(requested_blood_type, []):
-#         c.execute("SELECT quantity FROM blood_supply WHERE blood_type=?", (alt_type,))
-#         result = c.fetchone()
-#         if result and result[0] > 0:
-#             log_action("Suggest Alternative Blood", f"Requested: {requested_blood_type}, Suggested: {alt_type}")
-#             messagebox.showinfo("Alternative Available",
-#                                 f"Not enough {requested_blood_type}. Consider using {alt_type}.")
-#             return
-#     log_action("No Alternative Blood Available", f"Requested: {requested_blood_type}")
-#     messagebox.showerror("Error", f"No compatible blood type available for {requested_blood_type}.")
-#     conn.close()
-#
-# # Emergency blood function
-# def emergency_blood():
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("SELECT quantity FROM blood_supply WHERE blood_type='O-'")
-#     result = c.fetchone()
-#     if result and result[0] > 0:
-#         c.execute("UPDATE blood_supply SET quantity = 0 WHERE blood_type='O-'")
-#         conn.commit()
-#         log_action("Emergency Blood Issued", "All O- blood units issued")
-#         messagebox.showinfo("Success", "All O- blood units issued")
-#     else:
-#         log_action("No Emergency Blood Available", "No O- blood units available")
-#         messagebox.showerror("Error", "No O- blood units available")
-#     conn.close()
-#
-# # GUI for adding donors
-# def donor_gui():
-#     donor_window = tk.Toplevel()
-#     donor_window.title("Add Donor")
-#
-#     frame = ttk.Frame(donor_window, padding="10 10 10 10")
-#     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-#
-#     ttk.Label(frame, text="Name:").grid(row=0, column=0, pady=5)
-#     ttk.Label(frame, text="ID Number:").grid(row=1, column=0, pady=5)
-#     ttk.Label(frame, text="Blood Type:").grid(row=2, column=0, pady=5)
-#     ttk.Label(frame, text="Donation Date:").grid(row=3, column=0, pady=5)
-#
-#     entry_name = ttk.Entry(frame, font=("Arial", 12))
-#     entry_id_number = ttk.Entry(frame, font=("Arial", 12))
-#     entry_blood_type = ttk.Entry(frame, font=("Arial", 12))
-#     entry_donation_date = ttk.Entry(frame, font=("Arial", 12))
-#
-#     entry_name.grid(row=0, column=1, pady=5, padx=5)
-#     entry_id_number.grid(row=1, column=1, pady=5, padx=5)
-#     entry_blood_type.grid(row=2, column=1, pady=5, padx=5)
-#     entry_donation_date.grid(row=3, column=1, pady=5, padx=5)
-#
-#     ttk.Button(frame, text="Add Donor",
-#                command=lambda: add_donor(entry_name.get(), entry_id_number.get(), entry_blood_type.get(),
-#                                          entry_donation_date.get())).grid(row=4, columnspan=2, pady=10)
-#
-# # GUI for issuing blood
-# def issue_blood_gui():
-#     issue_window = tk.Toplevel()
-#     issue_window.title("Issue Blood")
-#
-#     frame = ttk.Frame(issue_window, padding="10 10 10 10")
-#     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-#
-#     ttk.Label(frame, text="Blood Type:").grid(row=0, column=0, pady=5)
-#     ttk.Label(frame, text="Quantity:").grid(row=1, column=0, pady=5)
-#
-#     entry_issue_blood_type = ttk.Entry(frame, font=("Arial", 12))
-#     entry_issue_quantity = ttk.Entry(frame, font=("Arial", 12))
-#
-#     entry_issue_blood_type.grid(row=0, column=1, pady=5, padx=5)
-#     entry_issue_quantity.grid(row=1, column=1, pady=5, padx=5)
-#
-#     ttk.Button(frame, text="Issue Blood",
-#                command=lambda: issue_blood(entry_issue_blood_type.get(), entry_issue_quantity.get())).grid(row=2,
-#                                                                                                            columnspan=2,
-#                                                                                                            pady=10)
-#
-# # GUI for emergency blood issue
-# def emergency_blood_gui():
-#     emergency_window = tk.Toplevel()
-#     emergency_window.title("Emergency Blood Issue")
-#
-#     frame = ttk.Frame(emergency_window, padding="10 10 10 10")
-#     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-#
-#     ttk.Button(frame, text="Issue Emergency Blood (O-)", command=emergency_blood).pack(pady=10)
-#
-# # GUI for creating users (Admin)
-# def create_user_gui():
-#     user_window = tk.Toplevel()
-#     user_window.title("Create User")
-#
-#     frame = ttk.Frame(user_window, padding="10 10 10 10")
-#     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-#
-#     ttk.Label(frame, text="Username:").grid(row=0, column=0, pady=5)
-#     ttk.Label(frame, text="Password:").grid(row=1, column=0, pady=5)
-#     ttk.Label(frame, text="Role:").grid(row=2, column=0, pady=5)
-#
-#     entry_username = ttk.Entry(frame, font=("Arial", 12))
-#     entry_password = ttk.Entry(frame, font=("Arial", 12), show="*")
-#     entry_role = ttk.Combobox(frame, values=["Admin", "User", "Research Student"], font=("Arial", 12))
-#
-#     entry_username.grid(row=0, column=1, pady=5, padx=5)
-#     entry_password.grid(row=1, column=1, pady=5, padx=5)
-#     entry_role.grid(row=2, column=1, pady=5, padx=5)
-#
-#     ttk.Button(frame, text="Create User",
-#                command=lambda: create_user(entry_username.get(), entry_password.get(), entry_role.get())).grid(row=3, columnspan=2, pady=10)
-#
-# # Export records to CSV
-# def export_records_to_csv():
-#     conn = sqlite3.connect('blood_bank.db')
-#     c = conn.cursor()
-#     c.execute("SELECT * FROM donors")
-#     donors = c.fetchall()
-#     c.execute("SELECT * FROM blood_supply")
-#     blood_supply = c.fetchall()
-#     c.execute("SELECT * FROM audit_trail")
-#     audit_trail = c.fetchall()
-#
-#     with open('donors.csv', 'w', newline='') as file:
-#         writer = csv.writer(file)
-#         writer.writerow(['ID', 'Name', 'ID Number', 'Blood Type', 'Donation Date'])
-#         writer.writerows(donors)
-#
-#     with open('blood_supply.csv', 'w', newline='') as file:
-#         writer = csv.writer(file)
-#         writer.writerow(['Blood Type', 'Quantity'])
-#         writer.writerows(blood_supply)
-#
-#     with open('audit_trail.csv', 'w', newline='') as file:
-#         writer = csv.writer(file)
-#         writer.writerow(['ID', 'Action', 'Details', 'Timestamp'])
-#         writer.writerows(audit_trail)
-#
-#     conn.close()
-#     messagebox.showinfo("Success", "Records exported successfully")
-#
-# # GUI for exporting records
-# def export_gui():
-#     export_window = tk.Toplevel()
-#     export_window.title("Export Records")
-#
-#     frame = ttk.Frame(export_window, padding="10 10 10 10")
-#     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-#
-#     ttk.Button(frame, text="Export Records to CSV", command=export_records_to_csv).grid(row=0, column=0, pady=10)
-#
-# # Main GUI window
-# def create_main_window():
-#     root = tk.Tk()
-#     root.title("Blood Establishment Computer Software")
-#
-#     # Load the image
-#     img = tk.PhotoImage(file="image2.png")
-#     logo_label = tk.Label(root, image=img)
-#     logo_label.pack(pady=10)
-#
-#     # Define styles
-#     style = ttk.Style()
-#     style.configure("TButton",
-#                     font=("Arial", 12),
-#                     padding=10,
-#                     background="#4CAF50",
-#                     foreground="black",
-#                     borderwidth=1)
-#     style.map("TButton",
-#               background=[('active', '#45a049')],
-#               foreground=[('active', 'black')])
-#
-#     style.configure("TLabel",
-#                     font=("Arial", 12),
-#                     padding=5)
-#
-#     style.configure("TEntry",
-#                     font=("Arial", 12),
-#                     padding=5)
-#
-#     main_frame = ttk.Frame(root, padding="20 20 20 20")
-#     main_frame.pack(fill=tk.BOTH, expand=True)
-#
-#     ttk.Button(main_frame, text="Add Donor", command=donor_gui).pack(pady=10, fill=tk.X)
-#     ttk.Button(main_frame, text="Issue Blood", command=issue_blood_gui).pack(pady=10, fill=tk.X)
-#     ttk.Button(main_frame, text="Emergency Blood Issue", command=emergency_blood_gui).pack(pady=10, fill=tk.X)
-#     ttk.Button(main_frame, text="Export Records", command=export_gui).pack(pady=10, fill=tk.X)
-#
-#     # Keep a reference to the image to prevent garbage collection
-#     root.img = img
-#
-#     root.mainloop()
-#
-# create_main_window()
-#
